@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.dist-info/
+.venv/
+venv/
+.env
+
+# Jupyter / editor
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Logs + runtime state
+logs/
+state/
+*.log
+
+# Thumbnails + local data
+thumbs/
+qdrant/
+meta.sqlite
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
