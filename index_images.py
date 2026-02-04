@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-index_images.py
----------------
-Indexes images under /mnt/moltbot/corpus/images into Qdrant for text<->image search.
+index_images.py (incremental)
+-----------------------------
+Incrementally indexes images under /mnt/moltbot/corpus/images into Qdrant for text<->image search.
 
-Key features:
-- Uses SentenceTransformers CLIP: sentence-transformers/clip-ViT-B-32
-- Text->image and image->image similarity search (same embedding space)
-- Stores image vectors in Qdrant with COSINE distance
-- Uses deterministic UUID point IDs derived from sha256 (Qdrant requires uint or UUID)
-- Stores sha256 + metadata as payload for stable identity, dedupe, and citations
-- Generates thumbnails to /ssd/moltbot/thumbs
-- Handles common photo extensions; optional HEIC/HEIF support if pillow-heif is installed
-- Prints a clear summary at the end
+Incremental logic:
+- Maintains a manifest at /ssd/moltbot/state/index_manifest.json
+- For each file path, if (mtime, size) unchanged since last run -> skip hashing/embedding/upsert
+- If changed/new -> process, embed, upsert, update manifest
 
-Prereqs:
-  pip install qdrant-client sentence-transformers pillow tqdm exifread imagehash
-Optional (for HEIC/HEIF):
-  pip install pillow-heif
+IDs:
+- Qdrant point IDs must be UUID or uint. We use a deterministic UUID derived from sha256 bytes.
+
+Payload:
+- Includes sha256, path, mtime, bytes, dimensions, mime, taken_ts, camera info, phash64, thumb path.
+
+Optional:
+- HEIC/HEIF support if pillow-heif is installed: pip install pillow-heif
 """
 
+import json
 import os
 import time
 import uuid
 import hashlib
 import mimetypes
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import exifread
 import imagehash
@@ -43,11 +44,14 @@ from sentence_transformers import SentenceTransformer
 # -----------------------------
 CORPUS_DIR = Path("/mnt/moltbot/corpus/images")
 THUMBS_DIR = Path("/ssd/moltbot/thumbs")
+STATE_DIR = Path("/ssd/moltbot/state")
+MANIFEST_PATH = STATE_DIR / "index_manifest.json"
+
 COLLECTION = "images"
 
 QDRANT_HOST = "127.0.0.1"
 QDRANT_PORT = 6333
-QDRANT_TIMEOUT = 120.0  # Jetson-friendly
+QDRANT_TIMEOUT = 7200.0  # Jetson-friendly
 
 MODEL_NAME = "sentence-transformers/clip-ViT-B-32"  # English-only baseline
 
@@ -57,11 +61,19 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 # Batch size for Qdrant upserts
 BATCH = 32
 
+# Optional cleanup: if True, remove manifest entries whose file no longer exists.
+# NOTE: This does NOT delete from Qdrant by default (see PRUNE_QDRANT_TOO).
+PRUNE_MISSING_MANIFEST = True
+
+# If True, also delete missing files from Qdrant (safe, but do it intentionally).
+# For nightly runs, I'd keep this False at first.
+PRUNE_QDRANT_TOO = True
+
 
 # -----------------------------
 # Optional HEIC/HEIF support
 # -----------------------------
-def _try_enable_heif():
+def _try_enable_heif() -> bool:
     try:
         from pillow_heif import register_heif_opener  # type: ignore
         register_heif_opener()
@@ -141,14 +153,42 @@ def infer_embedding_dim(model: SentenceTransformer) -> int:
     return int(dim)
 
 
-def list_image_files(root: Path) -> list[Path]:
-    paths: list[Path] = []
+def list_image_files(root: Path) -> List[Path]:
+    paths: List[Path] = []
     for r, _, files in os.walk(root):
         for fn in files:
             p = Path(r) / fn
             if p.suffix.lower() in IMAGE_EXTS:
                 paths.append(p)
     return paths
+
+
+def load_manifest() -> Dict[str, Dict[str, Any]]:
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        with MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_manifest(manifest: Dict[str, Dict[str, Any]]) -> None:
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST_PATH.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    tmp.replace(MANIFEST_PATH)
+
+
+def safe_resolve(p: Path) -> Path:
+    try:
+        return p.resolve()
+    except Exception:
+        return p.absolute()
 
 
 # -----------------------------
@@ -158,14 +198,17 @@ def main() -> None:
     if not CORPUS_DIR.exists():
         raise SystemExit(f"Corpus directory does not exist: {CORPUS_DIR}")
 
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"HEIC/HEIF support enabled: {HEIF_ENABLED}")
     print(f"Corpus: {CORPUS_DIR}")
     print(f"Thumbs: {THUMBS_DIR}")
+    print(f"State:  {STATE_DIR}")
     print(f"Qdrant: http://{QDRANT_HOST}:{QDRANT_PORT}")
     print(f"Model:  {MODEL_NAME}")
 
+    # Load model + determine dim
     model = SentenceTransformer(MODEL_NAME)
     dim = infer_embedding_dim(model)
     print(f"Embedding dim: {dim}")
@@ -180,27 +223,87 @@ def main() -> None:
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
             on_disk_payload=True,
         )
-        # Useful payload indexes for filtering
-        qc.create_payload_index(COLLECTION, "taken_ts", qm.PayloadSchemaType.INTEGER)
-        qc.create_payload_index(COLLECTION, "camera_model", qm.PayloadSchemaType.KEYWORD)
-        qc.create_payload_index(COLLECTION, "path", qm.PayloadSchemaType.KEYWORD)
+        # Best-effort payload indexes (ignore if unsupported/exists)
+        try:
+            qc.create_payload_index(COLLECTION, "taken_ts", qm.PayloadSchemaType.INTEGER)
+        except Exception:
+            pass
+        try:
+            qc.create_payload_index(COLLECTION, "camera_model", qm.PayloadSchemaType.KEYWORD)
+        except Exception:
+            pass
+        try:
+            qc.create_payload_index(COLLECTION, "path", qm.PayloadSchemaType.KEYWORD)
+        except Exception:
+            pass
 
+    # Load manifest
+    manifest = load_manifest()
+    manifest_before = len(manifest)
+
+    # Discover files
     paths = list_image_files(CORPUS_DIR)
     if not paths:
         print(f"No images found under: {CORPUS_DIR}")
         return
 
+    # Optional: prune missing manifest entries
+    if PRUNE_MISSING_MANIFEST and manifest:
+        existing_paths = set(str(p) for p in paths)
+        removed = 0
+        missing_items: List[Dict[str, Any]] = []
+        for mpath in list(manifest.keys()):
+            if mpath not in existing_paths:
+                removed += 1
+                missing_items.append(manifest[mpath])
+                del manifest[mpath]
+        if removed:
+            print(f"Pruned {removed} missing paths from manifest.")
+            # Optional: also delete from Qdrant
+            if PRUNE_QDRANT_TOO:
+                ids = []
+                for it in missing_items:
+                    pid = it.get("point_id")
+                    if pid:
+                        ids.append(pid)
+                if ids:
+                    print(f"Deleting {len(ids)} points from Qdrant (missing files).")
+                    qc.delete(
+                        collection_name=COLLECTION,
+                        points_selector=qm.PointIdsList(points=ids),
+                    )
+
     seen = 0
-    indexed = 0
-    skipped = 0
+    unchanged_skipped = 0
+    processed = 0
     upserted_points = 0
+    failed = 0
 
-    batch_points: list[qm.PointStruct] = []
+    batch_points: List[qm.PointStruct] = []
 
-    for p in tqdm(paths, desc="Indexing images"):
+    for p in tqdm(paths, desc="Indexing images (incremental)"):
         seen += 1
         try:
             st = p.stat()
+            path_key = str(p)
+
+            # Fast skip if unchanged
+            old = manifest.get(path_key)
+            if old and old.get("mtime") == int(st.st_mtime) and old.get("bytes") == int(st.st_size):
+                # Ensure thumbnail still exists; if missing, regenerate without re-embedding
+                sha_old = old.get("sha256")
+                if sha_old:
+                    thumb_path = THUMBS_DIR / f"{sha_old}.jpg"
+                    if not thumb_path.exists():
+                        try:
+                            img = Image.open(p)
+                            make_thumb(img, thumb_path)
+                        except Exception:
+                            pass
+                unchanged_skipped += 1
+                continue
+
+            # Process new/changed file
             sha = sha256_file(p)
             point_id = sha256_to_uuid(sha)
 
@@ -209,10 +312,8 @@ def main() -> None:
             img = Image.open(p)
             w, hgt = img.size
 
-            # Near-duplicate fingerprint
             ph = str(imagehash.phash(img))  # 16 hex chars (~64-bit)
 
-            # Thumbnail
             thumb_path = THUMBS_DIR / f"{sha}.jpg"
             if not thumb_path.exists():
                 make_thumb(img, thumb_path)
@@ -232,13 +333,19 @@ def main() -> None:
             }
             payload.update(exif_meta(p))
 
-            # Embed image
             emb = model.encode([img], normalize_embeddings=True)[0]
 
-            batch_points.append(
-                qm.PointStruct(id=point_id, vector=emb.tolist(), payload=payload)
-            )
-            indexed += 1
+            batch_points.append(qm.PointStruct(id=point_id, vector=emb.tolist(), payload=payload))
+            processed += 1
+
+            # Update manifest entry only after we successfully queue the point
+            manifest[path_key] = {
+                "mtime": int(st.st_mtime),
+                "bytes": int(st.st_size),
+                "sha256": sha,
+                "point_id": point_id,
+                "thumb": str(thumb_path),
+            }
 
             if len(batch_points) >= BATCH:
                 qc.upsert(collection_name=COLLECTION, points=batch_points)
@@ -246,13 +353,16 @@ def main() -> None:
                 batch_points = []
 
         except Exception as e:
-            skipped += 1
-            if skipped <= 25:
+            failed += 1
+            if failed <= 25:
                 print(f"SKIP {p}: {e}")
 
     if batch_points:
         qc.upsert(collection_name=COLLECTION, points=batch_points)
         upserted_points += len(batch_points)
+
+    # Save manifest at end (atomic)
+    save_manifest(manifest)
 
     # Final count
     try:
@@ -261,8 +371,14 @@ def main() -> None:
         total = None
 
     print(
-        f"Done. Seen={seen} Indexed={indexed} Skipped={skipped} "
-        f"Upserted={upserted_points} QdrantCount={total}"
+        "Done. "
+        f"Seen={seen} "
+        f"SkippedUnchanged={unchanged_skipped} "
+        f"Processed={processed} "
+        f"Upserted={upserted_points} "
+        f"Failed={failed} "
+        f"ManifestBefore={manifest_before} ManifestAfter={len(manifest)} "
+        f"QdrantCount={total}"
     )
 
 

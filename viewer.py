@@ -274,3 +274,45 @@ def original_image(sha256: str):
 
     # Let the browser infer image type if possible
     return FileResponse(str(p))
+
+# --- Spiny search grid (added) ---
+import os, json, urllib.parse, urllib.request
+from fastapi import Query
+from fastapi.responses import HTMLResponse
+
+SPINY_API_BASE = os.environ.get("SPINY_API_BASE", "http://127.0.0.1:8091")
+
+def _spiny_api_search(q: str, k: int):
+    url = f"{SPINY_API_BASE}/search_images?q={urllib.parse.quote(q)}&k={k}"
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+@app.get("/search", response_class=HTMLResponse)
+def search_grid(q: str = Query(..., min_length=1), k: int = Query(24, ge=1, le=200)):
+    payload = _spiny_api_search(q, k)
+    results = payload.get("results", [])
+
+    tiles = []
+    for r in results:
+        sha = r.get("sha256")
+        if not sha:
+            continue
+        score = r.get("score", 0.0)
+        path = (r.get("path") or "")
+        tiles.append(
+            f"<div style='width:180px;margin:8px;'>"
+            f"<a href='/img/{sha}'><img src='/thumb/{sha}' style='width:180px;border-radius:10px;'></a>"
+            f"<div style='font-size:12px;margin-top:6px;'>score={float(score):.4f}</div>"
+            f"<div style='font-size:11px;opacity:0.75;word-break:break-all;'>{path}</div>"
+            f"</div>"
+        )
+
+    html = (
+        "<html><body style='font-family:system-ui;'>"
+        f"<h3>Search: “{q}”</h3>"
+        "<div style='margin:10px 0;'><a href='/'>Home</a></div>"
+        "<div style='display:flex;flex-wrap:wrap;'>"
+        + "".join(tiles)
+        + "</div></body></html>"
+    )
+    return HTMLResponse(html)
