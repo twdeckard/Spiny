@@ -4,15 +4,14 @@ Spiny Signal Router
 
 - Receives Signal messages via signal-cli (supports both dataMessage and syncMessage sentMessage)
 - Routes "photos/images" and natural language photo queries to Spiny API (/search_images)
-- Routes "docs" queries to Spiny API (/search_docs)
-- Optionally uses a local LLM (via llm_provider.py) to curate a small subset from the top-N results
-- Supports session state: more/refine/exclude/only/reset
+- Adds "docs" command to query indexed PDFs via Spiny API (/search_docs)
+- Optionally uses a local LLM (via llm_provider.py) to curate a small subset from the top-N image results
+- Supports session state for photos: more/refine/exclude/only/reset
 - Supports thumbnail attachments via Signal: "thumbs [n]"
 - Adds a viewer grid link: http://LAN:8090/search?q=...&k=24
 
 Robustness:
-1) API calls catch connection errors and never crash the service.
-2) Call sites detect API errors and reply with a clear "API unreachable" message.
+- API calls never raise; errors return {"results": [], "error": "..."} and router replies cleanly.
 """
 
 import json
@@ -38,12 +37,16 @@ VIEWER_PORT = int(os.environ.get("SPINY_VIEWER_PORT", "8090"))
 VIEWER_BASE_ENV = os.environ.get("SPINY_VIEWER_BASE", "").strip()
 
 # Output + behavior
-RESULTS_K = int(os.environ.get("SPINY_K", "6"))  # How many to show in a message
+RESULTS_K = int(os.environ.get("SPINY_K", "6"))  # How many image results to show in a message
 VIEWER_GRID_K = int(os.environ.get("SPINY_VIEWER_K", "24"))  # How many the web grid should show
 MAX_MESSAGE_RESULTS = int(os.environ.get("SPINY_MAX_MESSAGE_RESULTS", "8"))  # hard cap per message
 MAX_ATTACH = int(os.environ.get("SPINY_MAX_ATTACH", "3"))  # max thumbs to attach in one command
 
-# LLM curation
+# Docs output
+DOCS_K = int(os.environ.get("SPINY_DOCS_K", "5"))  # How many docs results to show in a message
+DOCS_MAX_MESSAGE_RESULTS = int(os.environ.get("SPINY_DOCS_MAX_MESSAGE_RESULTS", "8"))  # hard cap per docs message
+
+# LLM curation (images only)
 LLM_CURATE_ENABLED = os.environ.get("SPINY_LLM_CURATE", "1").strip() not in ("0", "false", "False")
 LLM_CURATE_K = int(os.environ.get("SPINY_LLM_CURATE_K", str(RESULTS_K)))  # number of curated picks
 
@@ -51,50 +54,43 @@ LLM_CURATE_K = int(os.environ.get("SPINY_LLM_CURATE_K", str(RESULTS_K)))  # numb
 STATE_PATH = os.environ.get("SPINY_STATE_PATH", "/ssd/moltbot/state/spiny_sessions.json")
 
 REPLY_PREFIX = "📷 Spiny results for:"
-REPLY_DOCS_PREFIX = "📄 Spiny docs for:"
-NL_HINT = "Tip: try '@ dog', '? dog', 'more', 'refine sunset', 'thumbs 3', '/ help'"
+DOCS_REPLY_PREFIX = "📄 Spiny docs for:"
+NL_HINT = "Tip: try 'photos dog', 'docs ford thunderbird fuel pump', 'more', 'refine sunset', 'thumbs 3', 'brain help'"
 CMD_HELP_TEXT = (
     "Commands:\n"
-    "- photos <query>           (search images)\n"
-    "- @ <query>               (alias for photos)\n"
-    "- docs <query>            (search PDFs)\n"
-    "- ? <query>               (alias for docs)\n"
-    "- show me pictures of <x> (natural language image search)\n"
-    "- more [n]                (show more results)\n"
-    "- refine <text>           (append to current query)\n"
-    "- exclude <text>          (soft exclude)\n"
-    "- only <text>             (replace query)\n"
-    "- thumbs [n]              (send thumb attachments)\n"
-    "- spiny <question>        (local assistant)\n"
-    "- / <question>            (alias for spiny)\n"
-    "- ^                       (Danger Will Robinson)\n"
-    "- reset                   (clear session)\n"
-    "- help | ?                (this help)\n"
+    "- photos <query>           (image search)\n"
+    "- photos <query> raw       (skip LLM curation)\n"
+    "- show me pictures of <x>  (natural language image search)\n"
+    "- docs <query>             (PDF search)\n"
+    "- more [n]                 (show more image results)\n"
+    "- refine <text>            (append to current image query)\n"
+    "- exclude <text>           (soft exclude from image query)\n"
+    "- only <text>              (replace image query)\n"
+    "- thumbs [n]               (send thumb attachments for last image results)\n"
+    "- brain <question>         (local assistant)\n"
+    "- reset                    (clear session)\n"
 )
 
-# --- Natural language triggers ---
+# --- Natural language triggers (images) ---
 CMD_EXPLICIT = re.compile(r"^\s*(photos|images)\s*[: ]\s*(.+)$", re.IGNORECASE)
-CMD_EXPLICIT_DOCS = re.compile(r"^\s*(docs)\s*[: ]\s*(.+)$", re.IGNORECASE)
-
-CMD_AT = re.compile(r"^\s*@\s*(.+)$")          # alias for photos
-CMD_QMARK = re.compile(r"^\s*\?\s*(.+)?$")     # alias for docs (also help when blank or just '?')
-CMD_SLASH = re.compile(r"^\s*/\s*(.*)$")       # alias for spiny
-CMD_CARET = re.compile(r"^\s*\^\s*$")          # Danger Will Robinson
-
 CMD_NL = re.compile(
     r"^\s*(show|find|search|look)\s+.*\b(photos|pictures|images|pics)\b\s*(of|for)?\s*(.+)$",
     re.IGNORECASE,
 )
 CMD_DO_YOU_HAVE = re.compile(r"^\s*do you have (any )?(photos|pictures|images)\s*(of)?\s*(.+)$", re.IGNORECASE)
 
+# --- Commands ---
 CMD_MORE = re.compile(r"^\s*more(\s+(\d+))?\s*$", re.IGNORECASE)
 CMD_REFINE = re.compile(r"^\s*refine\s+(.+)$", re.IGNORECASE)
 CMD_ONLY = re.compile(r"^\s*only\s+(.+)$", re.IGNORECASE)
 CMD_EXCLUDE = re.compile(r"^\s*exclude\s+(.+)$", re.IGNORECASE)
 CMD_RESET = re.compile(r"^\s*reset\s*$", re.IGNORECASE)
 CMD_THUMBS = re.compile(r"^\s*thumbs(\s+(\d+))?\s*$", re.IGNORECASE)
-CMD_SPINY = re.compile(r"^\s*spiny\s+(.+)$", re.IGNORECASE)
+CMD_BRAIN = re.compile(r"^\s*brain\s+(.+)$", re.IGNORECASE)
 CMD_HELP = re.compile(r"^\s*(help|\?)\s*$", re.IGNORECASE)
+
+# --- Docs command ---
+CMD_DOCS = re.compile(r"^\s*docs\s*[: ]\s*(.+)$", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -125,26 +121,32 @@ def save_state(state: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def api_get_json(path_and_query: str, timeout_s: int = 120) -> Dict[str, Any]:
+def api_search_images(query: str, k: int) -> Dict[str, Any]:
     """
     Robust API call: never raises.
     If unreachable, returns {"results": [], "error": "..."}.
     """
-    url = f"{API_BASE}{path_and_query}"
+    url = f"{API_BASE}/search_images?q={urllib.parse.quote(query)}&k={k}"
     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(url, timeout=120) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        log(f"api_get_json failed url={url!r} err={e!r}")
+        log(f"api_search_images failed url={url!r} err={e!r}")
         return {"results": [], "error": str(e)}
 
 
-def api_search_images(query: str, k: int) -> Dict[str, Any]:
-    return api_get_json(f"/search_images?q={urllib.parse.quote(query)}&k={k}")
-
-
 def api_search_docs(query: str, k: int) -> Dict[str, Any]:
-    return api_get_json(f"/search_docs?q={urllib.parse.quote(query)}&k={k}")
+    """
+    Robust API call: never raises.
+    If unreachable, returns {"results": [], "error": "..."}.
+    """
+    url = f"{API_BASE}/search_docs?q={urllib.parse.quote(query)}&k={k}"
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log(f"api_search_docs failed url={url!r} err={e!r}")
+        return {"results": [], "error": str(e)}
 
 
 def send_signal(recipient: str, text: str, attachment: Optional[str] = None) -> bool:
@@ -240,25 +242,15 @@ def extract_text_and_reply_to(evt: dict) -> Tuple[Optional[str], Optional[str], 
     return None, None, None
 
 
-def parse_image_query(msg: str) -> Optional[Tuple[str, bool]]:
+def parse_query(msg: str) -> Optional[Tuple[str, bool]]:
     """
     Returns (query, raw_mode) where raw_mode means "skip LLM curation".
     Recognizes:
       - "photos dog"
       - "photos dog raw"
-      - "@ dog"  (alias)
       - natural language "show me pictures of dog"
     """
     raw_mode = False
-
-    m = CMD_AT.match(msg)
-    if m:
-        q = (m.group(1) or "").strip()
-        if q.lower().endswith(" raw"):
-            raw_mode = True
-            q = q[:-4].strip()
-        return q, raw_mode
-
     m = CMD_EXPLICIT.match(msg)
     if m:
         q = m.group(2).strip()
@@ -280,31 +272,13 @@ def parse_image_query(msg: str) -> Optional[Tuple[str, bool]]:
     return None
 
 
-def parse_docs_query(msg: str) -> Optional[str]:
+def format_results(query: str, results: List[dict], start: int = 0, curated: bool = False) -> Tuple[str, List[str]]:
     """
-    Recognizes:
-      - "docs dog"
-      - "? dog" (alias)
-    Note: bare "?" is treated as help (handled earlier).
-    """
-    m = CMD_EXPLICIT_DOCS.match(msg)
-    if m:
-        return m.group(2).strip()
-
-    m = CMD_QMARK.match(msg)
-    if m:
-        q = (m.group(1) or "").strip()
-        return q if q else None
-
-    return None
-
-
-def format_image_results(query: str, results: List[dict], start: int = 0, curated: bool = False) -> Tuple[str, List[str]]:
-    """
+    Image results formatter.
     Returns (message_text, shown_shas)
     """
     if not results:
-        return (f'No image results for: "{query}"\n\n{NL_HINT}', [])
+        return (f'No results for: "{query}"\n\n{NL_HINT}', [])
 
     vb = viewer_base()
     header = f'{REPLY_PREFIX} "{query}"'
@@ -336,46 +310,46 @@ def format_image_results(query: str, results: List[dict], start: int = 0, curate
             lines.append(f"   path:  {path}")
         lines.append("")
 
-    lines.append("Commands: more | refine <text> | exclude <text> | only <text> | thumbs [n] | spiny <q> | / <q> | reset")
+    lines.append("Commands: more | refine <text> | exclude <text> | only <text> | thumbs [n] | brain <q> | reset")
     return ("\n".join(lines).strip(), shown_shas)
 
 
-def format_docs_results(query: str, results: List[dict], start: int = 0) -> str:
+def format_docs_results(query: str, results: List[dict]) -> str:
+    """
+    Docs results formatter.
+    Results are expected like:
+      {score, path, page, chunk, snippet}
+    """
     if not results:
-        return (f'No doc results for: "{query}"\n\n{NL_HINT}').strip()
+        return f'{DOCS_REPLY_PREFIX} "{query}"\nNo results.\n\n{NL_HINT}'
 
-    count = min(MAX_MESSAGE_RESULTS, RESULTS_K)
-    shown = results[start:start + count]
-
-    lines = [
-        f'{REPLY_DOCS_PREFIX} "{query}"',
+    lines: List[str] = [
+        f'{DOCS_REPLY_PREFIX} "{query}"',
         ""
     ]
-    for i, r in enumerate(shown, 1 + start):
-        score = float(r.get("score", 0.0))
-        path = r.get("path") or ""
+
+    count = min(DOCS_MAX_MESSAGE_RESULTS, DOCS_K)
+    shown = results[:count]
+
+    for i, r in enumerate(shown, 1):
+        score = r.get("score", 0.0)
+        path = (r.get("path") or "")
         page = r.get("page")
         snippet = (r.get("snippet") or "").strip()
-        chunk = r.get("chunk")
+        if len(snippet) > 360:
+            snippet = snippet[:360].rstrip() + "…"
 
-        where = []
-        if path:
-            where.append(path)
-        if page is not None:
-            where.append(f"p.{page}")
-        if chunk is not None:
-            where.append(f"chunk {chunk}")
-
-        lines.append(f"{i}. score={score:.4f}  {' | '.join(where)}")
+        # Short doc name
+        doc_name = os.path.basename(path) if path else "(unknown)"
+        page_str = f"p.{int(page)}" if isinstance(page, (int, float)) else "p.?"
+        lines.append(f"{i}. {doc_name} {page_str}  score={float(score):.4f}")
         if snippet:
-            # Keep it Signal-friendly
-            sn = snippet.replace("\n", " ").strip()
-            if len(sn) > 350:
-                sn = sn[:350].rstrip() + "…"
-            lines.append(f"   {sn}")
+            lines.append(f"   {snippet}")
+        if path:
+            lines.append(f"   path: {path}")
         lines.append("")
 
-    lines.append("Commands: more | refine <text> | exclude <text> | only <text> | spiny <q> | / <q> | reset")
+    lines.append("Tip: docs <query>  (e.g., docs fuel pump priming)")
     return "\n".join(lines).strip()
 
 
@@ -426,7 +400,7 @@ def curate_subset(query: str, results_full: List[dict], k: int) -> List[dict]:
         return results_full[:k]
 
 
-def spiny_reply(user_text: str) -> str:
+def brain_reply(user_text: str) -> str:
     """
     Small local assistant. Must stay grounded (no image hallucination).
     """
@@ -434,17 +408,15 @@ def spiny_reply(user_text: str) -> str:
         "You are Spiny, a small local assistant running on a Jetson.\n"
         "Be concise, helpful, and practical.\n"
         "If asked about images, you do NOT see images; you only know filenames/paths/scores when provided.\n"
-        "If asked about documents, you only know snippets/paths/pages when provided.\n"
         "When asked for commands, show brief usage.\n"
     )
-    t = user_text.strip()
-    if t.lower() in ("help", "commands"):
+    if user_text.strip().lower() in ("help", "commands"):
         return CMD_HELP_TEXT
     try:
-        out = llm_provider.chat(system=system, user=t, max_tokens=220)
+        out = llm_provider.chat(system=system, user=user_text, max_tokens=220)
         return out[:3500] if out else "No response."
     except Exception as e:
-        return f"Local spiny unavailable: {e}"
+        return f"Local brain unavailable: {e}"
 
 
 def main() -> None:
@@ -480,23 +452,14 @@ def main() -> None:
             msg_stripped = msg.strip()
 
             # Avoid loops if our own long reply is mirrored back via syncMessage
-            if msg_stripped.startswith(REPLY_PREFIX) or msg_stripped.startswith(REPLY_DOCS_PREFIX):
+            if msg_stripped.startswith(REPLY_PREFIX) or msg_stripped.startswith(DOCS_REPLY_PREFIX):
                 continue
 
             log(f"rx convo={convo_key!r} from={reply_to!r} msg={msg_stripped!r}")
             sess = state.get(convo_key) or {}
 
-            # CARET
-            if CMD_CARET.match(msg_stripped):
-                send_signal(reply_to, "Danger Will Robinson")
-                continue
-
             # HELP
-            # Note: '?' alone is help, while '? <query>' is docs
-            if CMD_HELP.match(msg_stripped) and msg_stripped.strip() != "?":
-                send_signal(reply_to, CMD_HELP_TEXT)
-                continue
-            if msg_stripped.strip() == "?":
+            if CMD_HELP.match(msg_stripped):
                 send_signal(reply_to, CMD_HELP_TEXT)
                 continue
 
@@ -507,21 +470,29 @@ def main() -> None:
                 send_signal(reply_to, "Session reset. " + NL_HINT)
                 continue
 
-            # SPINY (local assistant) via "spiny ..."
-            ms = CMD_SPINY.match(msg_stripped)
-            if ms:
-                q = ms.group(1).strip()
-                send_signal(reply_to, spiny_reply(q))
+            # DOCS (PDF search)
+            md = CMD_DOCS.match(msg_stripped)
+            if md:
+                qd = md.group(1).strip()
+                if not qd:
+                    send_signal(reply_to, "Usage: docs <query>")
+                    continue
+
+                payload = api_search_docs(qd, k=DOCS_K)
+                if payload.get("error"):
+                    reply_api_unreachable(reply_to, op="docs", err=str(payload.get("error")))
+                    continue
+
+                results = payload.get("results", []) or []
+                txt = format_docs_results(qd, results)
+                send_signal(reply_to, txt)
                 continue
 
-            # SPINY alias via "/ ..."
-            mslash = CMD_SLASH.match(msg_stripped)
-            if mslash:
-                q = (mslash.group(1) or "").strip()
-                if not q:
-                    send_signal(reply_to, CMD_HELP_TEXT)
-                else:
-                    send_signal(reply_to, spiny_reply(q))
+            # BRAIN (local assistant)
+            mb = CMD_BRAIN.match(msg_stripped)
+            if mb:
+                q = mb.group(1).strip()
+                send_signal(reply_to, brain_reply(q))
                 continue
 
             # THUMBS
@@ -532,7 +503,7 @@ def main() -> None:
 
                 shown = sess.get("last_shown_shas") or []
                 if not shown:
-                    send_signal(reply_to, "No recent image results to attach. Search first (e.g., '@ dog').")
+                    send_signal(reply_to, "No recent results to attach. Search first (e.g., 'photos dog').")
                     continue
 
                 sent_any = False
@@ -547,7 +518,7 @@ def main() -> None:
                     send_signal(reply_to, "Couldn't find thumbnail files on disk for the current results.")
                 continue
 
-            # MORE (applies to last mode: images or docs)
+            # MORE (images)
             mm = CMD_MORE.match(msg_stripped)
             if mm:
                 inc = int(mm.group(2) or str(RESULTS_K))
@@ -555,39 +526,31 @@ def main() -> None:
 
                 results_full = sess.get("results_full") or []
                 if not results_full:
-                    send_signal(reply_to, "No active results. Search first (e.g., '@ dog' or '? dog').")
+                    send_signal(reply_to, "No active results. Search first (e.g., 'photos dog').")
                     continue
 
                 offset = int(sess.get("offset", 0))
                 start = offset
                 sess["offset"] = offset + inc
 
-                mode = sess.get("mode", "images")
                 query = sess.get("query", "")
                 curated = bool(sess.get("curated", False))
+                txt, shown_shas = format_results(query, results_full, start=start, curated=curated)
 
-                if mode == "docs":
-                    txt = format_docs_results(query, results_full, start=start)
-                    sess["last_shown_shas"] = []
-                else:
-                    txt, shown_shas = format_image_results(query, results_full, start=start, curated=curated)
-                    sess["last_shown_shas"] = shown_shas
-
+                sess["last_shown_shas"] = shown_shas
                 state[convo_key] = sess
                 save_state(state)
                 send_signal(reply_to, txt)
                 continue
 
-            # REFINE / ONLY / EXCLUDE (re-run in same mode)
+            # REFINE / ONLY / EXCLUDE (images)
             mr = CMD_REFINE.match(msg_stripped)
             mo = CMD_ONLY.match(msg_stripped)
             me = CMD_EXCLUDE.match(msg_stripped)
             if mr or mo or me:
                 base_q = sess.get("query") or ""
-                mode = sess.get("mode", "images")
-
                 if not base_q and not mo:
-                    send_signal(reply_to, "No active query to refine. Search first (e.g., '@ dog' or '? dog').")
+                    send_signal(reply_to, "No active query to refine. Search first (e.g., 'photos dog').")
                     continue
 
                 if mr:
@@ -600,33 +563,23 @@ def main() -> None:
                     new_q = f"{base_q}, without {me.group(1).strip()}"
                     op = "exclude"
 
-                if mode == "docs":
-                    payload = api_search_docs(new_q, k=200)
-                else:
-                    payload = api_search_images(new_q, k=200)
-
+                payload = api_search_images(new_q, k=200)
                 if payload.get("error"):
-                    reply_api_unreachable(reply_to, op=f"{op}:{mode}", err=str(payload.get("error")))
+                    reply_api_unreachable(reply_to, op=op, err=str(payload.get("error")))
                     continue
 
                 results_full = payload.get("results", []) or []
-                curated = False
 
-                if mode == "images" and results_full and LLM_CURATE_ENABLED:
+                curated = False
+                if results_full and LLM_CURATE_ENABLED:
                     curated_subset = curate_subset(new_q, results_full, k=LLM_CURATE_K)
                     curated_shas = {r.get("sha256") for r in curated_subset if r.get("sha256")}
                     remainder = [r for r in results_full if r.get("sha256") not in curated_shas]
                     results_full = curated_subset + remainder
                     curated = True
 
-                if mode == "docs":
-                    txt = format_docs_results(new_q, results_full, start=0)
-                    shown_shas = []
-                else:
-                    txt, shown_shas = format_image_results(new_q, results_full, start=0, curated=curated)
-
+                txt, shown_shas = format_results(new_q, results_full, start=0, curated=curated)
                 sess = {
-                    "mode": mode,
                     "query": new_q,
                     "results_full": results_full,
                     "offset": RESULTS_K,
@@ -638,37 +591,13 @@ def main() -> None:
                 send_signal(reply_to, txt)
                 continue
 
-            # DOCS search
-            dq = parse_docs_query(msg_stripped)
-            if dq:
-                payload = api_search_docs(dq, k=200)
-                if payload.get("error"):
-                    reply_api_unreachable(reply_to, op="docs", err=str(payload.get("error")))
-                    continue
-
-                results_full = payload.get("results", []) or []
-                txt = format_docs_results(dq, results_full, start=0)
-
-                sess = {
-                    "mode": "docs",
-                    "query": dq,
-                    "results_full": results_full,
-                    "offset": RESULTS_K,
-                    "curated": False,
-                    "last_shown_shas": [],
-                }
-                state[convo_key] = sess
-                save_state(state)
-                send_signal(reply_to, txt)
-                continue
-
-            # IMAGE search (photos/@/NL)
-            pq = parse_image_query(msg_stripped)
+            # NEW IMAGE SEARCH QUERY
+            pq = parse_query(msg_stripped)
             if pq:
                 q, raw_mode = pq
                 payload = api_search_images(q, k=200)
                 if payload.get("error"):
-                    reply_api_unreachable(reply_to, op="photos", err=str(payload.get("error")))
+                    reply_api_unreachable(reply_to, op="search", err=str(payload.get("error")))
                     continue
 
                 results_full = payload.get("results", []) or []
@@ -681,9 +610,8 @@ def main() -> None:
                     results_full = curated_subset + remainder
                     curated = True
 
-                txt, shown_shas = format_image_results(q, results_full, start=0, curated=curated)
+                txt, shown_shas = format_results(q, results_full, start=0, curated=curated)
                 sess = {
-                    "mode": "images",
                     "query": q,
                     "results_full": results_full,
                     "offset": RESULTS_K,
@@ -700,7 +628,7 @@ def main() -> None:
                 q = msg_stripped
                 payload = api_search_images(q, k=200)
                 if payload.get("error"):
-                    reply_api_unreachable(reply_to, op="photos", err=str(payload.get("error")))
+                    reply_api_unreachable(reply_to, op="search", err=str(payload.get("error")))
                     continue
 
                 results_full = payload.get("results", []) or []
@@ -713,9 +641,8 @@ def main() -> None:
                     results_full = curated_subset + remainder
                     curated = True
 
-                txt, shown_shas = format_image_results(q, results_full, start=0, curated=curated)
+                txt, shown_shas = format_results(q, results_full, start=0, curated=curated)
                 sess = {
-                    "mode": "images",
                     "query": q,
                     "results_full": results_full,
                     "offset": RESULTS_K,
